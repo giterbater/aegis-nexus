@@ -1,0 +1,344 @@
+---
+# AEGIS NEXUS — Kubernetes Deployment Manifests
+# Production-grade cloud-native deployment
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: aegis-nexus
+  labels:
+    app.kubernetes.io/name: aegis-nexus
+    security.aegis/classification: restricted
+
+---
+# ConfigMap — shared configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aegis-config
+  namespace: aegis-nexus
+data:
+  KAFKA_BOOTSTRAP: "kafka-cluster-kafka-bootstrap:9092"
+  QDRANT_HOST: "qdrant-service"
+  QDRANT_PORT: "6333"
+  NEO4J_URI: "bolt://neo4j-service:7687"
+  REDIS_HOST: "redis-service"
+  ENVIRONMENT: "production"
+  LOG_LEVEL: "info"
+
+---
+# Intelligence API Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: intelligence-api
+  namespace: aegis-nexus
+  labels:
+    app: intelligence-api
+    tier: backend
+    version: v4.2.1
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: intelligence-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: intelligence-api
+        tier: backend
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/metrics"
+        prometheus.io/port: "8000"
+    spec:
+      serviceAccountName: aegis-api-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 2000
+      containers:
+        - name: intelligence-api
+          image: aegis-nexus/intelligence-api:4.2.1
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+              name: http
+          envFrom:
+            - configMapRef:
+                name: aegis-config
+            - secretRef:
+                name: aegis-secrets
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: intelligence-api
+                topologyKey: kubernetes.io/hostname
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: intelligence-api-service
+  namespace: aegis-nexus
+spec:
+  selector:
+    app: intelligence-api
+  ports:
+    - port: 80
+      targetPort: 8000
+      name: http
+  type: ClusterIP
+
+---
+# AI Agents Deployment — with HPA
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-agents
+  namespace: aegis-nexus
+  labels:
+    app: ai-agents
+    tier: ai
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ai-agents
+  template:
+    metadata:
+      labels:
+        app: ai-agents
+        tier: ai
+    spec:
+      containers:
+        - name: ai-agents
+          image: aegis-nexus/ai-agents:4.2.1
+          envFrom:
+            - configMapRef:
+                name: aegis-config
+            - secretRef:
+                name: aegis-secrets
+          resources:
+            requests:
+              cpu: "1000m"
+              memory: "1Gi"
+            limits:
+              cpu: "4000m"
+              memory: "4Gi"
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ai-agents-hpa
+  namespace: aegis-nexus
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ai-agents
+  minReplicas: 2
+  maxReplicas: 12
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: External
+      external:
+        metric:
+          name: kafka_consumer_lag
+          selector:
+            matchLabels:
+              topic: aegis.agent-tasks
+        target:
+          type: AverageValue
+          averageValue: "100"
+
+---
+# Event Pipeline Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: event-pipeline
+  namespace: aegis-nexus
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: event-pipeline
+  template:
+    metadata:
+      labels:
+        app: event-pipeline
+    spec:
+      containers:
+        - name: event-pipeline
+          image: aegis-nexus/event-pipeline:4.2.1
+          envFrom:
+            - configMapRef:
+                name: aegis-config
+            - secretRef:
+                name: aegis-secrets
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+
+---
+# Web Frontend Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aegis-web
+  namespace: aegis-nexus
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: aegis-web
+  template:
+    metadata:
+      labels:
+        app: aegis-web
+    spec:
+      containers:
+        - name: aegis-web
+          image: aegis-nexus/web:4.2.1
+          ports:
+            - containerPort: 3000
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+
+---
+# Ingress — HTTPS with cert-manager
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: aegis-ingress
+  namespace: aegis-nexus
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/enable-websocket: "true"
+spec:
+  tls:
+    - hosts:
+        - aegis.yourdomain.com
+      secretName: aegis-tls
+  rules:
+    - host: aegis.yourdomain.com
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: intelligence-api-service
+                port:
+                  number: 80
+          - path: /ws
+            pathType: Prefix
+            backend:
+              service:
+                name: intelligence-api-service
+                port:
+                  number: 80
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: aegis-web-service
+                port:
+                  number: 80
+
+---
+# Network Policy — zero-trust
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aegis-default-deny
+  namespace: aegis-nexus
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-intelligence-api
+  namespace: aegis-nexus
+spec:
+  podSelector:
+    matchLabels:
+      app: intelligence-api
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - port: 8000
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              tier: data
+    - to: []
+      ports:
+        - port: 443
+        - port: 80

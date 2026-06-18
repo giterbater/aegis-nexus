@@ -1,0 +1,228 @@
+name: AEGIS NEXUS — CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ${{ github.repository_owner }}/aegis-nexus
+
+jobs:
+  # ────────────────────────────────────────────────────────────
+  # Frontend
+  # ────────────────────────────────────────────────────────────
+  frontend:
+    name: Frontend — Build & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Install dependencies
+        working-directory: apps/web
+        run: npm ci --legacy-peer-deps
+
+      - name: Type check
+        working-directory: apps/web
+        run: npm run type-check
+
+      - name: Lint
+        working-directory: apps/web
+        run: npm run lint
+
+      - name: Build
+        working-directory: apps/web
+        run: npm run build
+        env:
+          NEXT_PUBLIC_API_URL: https://api.aegis-nexus.io
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-build
+          path: apps/web/.next
+          retention-days: 7
+
+  # ────────────────────────────────────────────────────────────
+  # Backend Services
+  # ────────────────────────────────────────────────────────────
+  backend:
+    name: Backend — Python Services
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [intelligence-api, ai-agents, event-stream, web-crawler]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: services/${{ matrix.service }}/requirements.txt
+
+      - name: Install dependencies
+        working-directory: services/${{ matrix.service }}
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Lint (ruff)
+        working-directory: services/${{ matrix.service }}
+        run: ruff check .
+
+      - name: Type check (mypy)
+        working-directory: services/${{ matrix.service }}
+        run: mypy . --ignore-missing-imports
+
+      - name: Tests
+        working-directory: services/${{ matrix.service }}
+        run: pytest --cov --cov-report=xml -x
+        env:
+          ENVIRONMENT: test
+          DATABASE_URL: postgresql+asyncpg://aegis:test@localhost/aegis_test
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          flags: ${{ matrix.service }}
+
+  # ────────────────────────────────────────────────────────────
+  # Security
+  # ────────────────────────────────────────────────────────────
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          exit-code: 1
+
+      - name: Secret scan (gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ────────────────────────────────────────────────────────────
+  # Docker Build & Push (main branch only)
+  # ────────────────────────────────────────────────────────────
+  docker:
+    name: Docker — Build & Push
+    runs-on: ubuntu-latest
+    needs: [frontend, backend, security]
+    if: github.ref == 'refs/heads/main'
+    strategy:
+      matrix:
+        service:
+          - { name: web,               context: apps/web }
+          - { name: intelligence-api,  context: services/intelligence-api }
+          - { name: ai-agents,         context: services/ai-agents }
+          - { name: event-pipeline,    context: services/event-stream }
+          - { name: web-crawler,       context: services/web-crawler }
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service.name }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.service.context }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+
+  # ────────────────────────────────────────────────────────────
+  # Deploy to Production
+  # ────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy — Production EKS
+    runs-on: ubuntu-latest
+    needs: [docker]
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://aegis.yourdomain.com
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name aegis-nexus --region us-east-1
+
+      - name: Deploy to Kubernetes
+        run: |
+          kubectl set image deployment/intelligence-api \
+            intelligence-api=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/intelligence-api:sha-${{ github.sha }} \
+            -n aegis-nexus
+
+          kubectl set image deployment/ai-agents \
+            ai-agents=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/ai-agents:sha-${{ github.sha }} \
+            -n aegis-nexus
+
+          kubectl set image deployment/aegis-web \
+            aegis-web=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/web:sha-${{ github.sha }} \
+            -n aegis-nexus
+
+          kubectl rollout status deployment/intelligence-api -n aegis-nexus --timeout=5m
+          kubectl rollout status deployment/ai-agents -n aegis-nexus --timeout=5m
+          kubectl rollout status deployment/aegis-web -n aegis-nexus --timeout=5m
+
+      - name: Smoke test
+        run: |
+          INGRESS_IP=$(kubectl get svc ingress-nginx-controller -n ingress-nginx -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          curl -f --retry 5 --retry-delay 10 https://aegis.yourdomain.com/health
+
+      - name: Notify Slack
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          channel: "#aegis-deployments"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

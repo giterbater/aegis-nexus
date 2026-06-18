@@ -1,0 +1,14 @@
+{
+  "name": "aegis-nexus",
+  "version": "4.2.1",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev":   "npm run dev --workspace=apps/web",
+    "build": "npm run build --workspace=apps/web",
+    "start": "npm run start --workspace=apps/web"
+  }
+}
