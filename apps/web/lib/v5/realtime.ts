@@ -1,29 +1,70 @@
 'use client'
 
-import { useEffect } from 'react'
+import { useEffect, useRef } from 'react'
 import { useAegisV5Store } from './store'
 import { normalizeIntelligenceEvents } from './normalize'
+import { getRealtimeConfig } from './realtime-config'
 
 export function useAegisV5Realtime(enabled = true) {
   const setMode = useAegisV5Store((state) => state.setMode)
   const ingestEvents = useAegisV5Store((state) => state.ingestEvents)
+  const timer = useRef<number | null>(null)
+  const stopped = useRef(false)
 
   useEffect(() => {
     if (!enabled) return
-    const endpoint = process.env.NEXT_PUBLIC_AEGIS_STREAM_URL ?? '/api/intel/stream'
+    const config = getRealtimeConfig()
+    stopped.current = false
     let source: EventSource | null = null
-    let stopped = false
+    let attempt = 0
+    let heartbeatTimer: number | null = null
+
+    const clearTimers = () => {
+      if (timer.current !== null) window.clearTimeout(timer.current)
+      if (heartbeatTimer !== null) window.clearTimeout(heartbeatTimer)
+      timer.current = null
+      heartbeatTimer = null
+    }
+
+    const scheduleReconnect = () => {
+      if (stopped.current || timer.current !== null) return
+      const delay = Math.min(config.reconnectBaseMs * 2 ** attempt, config.reconnectMaxMs)
+      attempt += 1
+      timer.current = window.setTimeout(() => {
+        timer.current = null
+        connect()
+      }, delay)
+    }
+
+    const armHeartbeat = () => {
+      if (heartbeatTimer !== null) window.clearTimeout(heartbeatTimer)
+      heartbeatTimer = window.setTimeout(() => {
+        setMode('DEGRADED')
+        source?.close()
+        scheduleReconnect()
+      }, config.heartbeatTimeoutMs)
+    }
 
     const connect = () => {
-      if (stopped) return
+      if (stopped.current) return
       setMode('CONNECTING')
-      source = new EventSource(endpoint)
-      source.onopen = () => setMode('LIVE')
+      source?.close()
+      source = new EventSource(config.endpoint)
+      source.onopen = () => {
+        attempt = 0
+        setMode('LIVE')
+        armHeartbeat()
+      }
       source.onmessage = (message) => {
         try {
-          const parsed = JSON.parse(message.data)
-          const events = normalizeIntelligenceEvents(parsed.events ?? parsed)
+          const parsed = JSON.parse(message.data) as Record<string, unknown>
+          if (parsed.type === 'heartbeat' || parsed.type === 'connected') {
+            armHeartbeat()
+            return
+          }
+          const events = normalizeIntelligenceEvents(parsed.data ?? parsed.events ?? parsed)
           if (events.length) ingestEvents(events)
+          armHeartbeat()
         } catch {
           setMode('ERROR')
         }
@@ -31,14 +72,15 @@ export function useAegisV5Realtime(enabled = true) {
       source.onerror = () => {
         setMode('DEGRADED')
         source?.close()
-        if (!stopped) window.setTimeout(connect, 3000)
+        scheduleReconnect()
       }
     }
 
     connect()
     return () => {
-      stopped = true
+      stopped.current = true
       source?.close()
+      clearTimers()
     }
   }, [enabled, ingestEvents, setMode])
 }
